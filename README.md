@@ -118,4 +118,4 @@ internal/bot
 
 ## 许可
 
-Apache-2.0
+[Apache-2.0](https://github.com/justinwoo280/yt-music-bot/blob/main/LICENSE)
