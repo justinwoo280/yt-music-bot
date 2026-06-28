@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,14 +26,103 @@ type Track struct {
 }
 
 const (
-	innertubeKey  = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
-	innertubeURL  = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key=" + innertubeKey
-	clientVersion = "2.20240601.00.00"
-	searchTimeout = 25 * time.Second
+	defaultClientVersion = "2.20240601.00.00"
+	searchTimeout        = 25 * time.Second
+	innertubeSearchURL   = "https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key="
+	innertubeCacheTTL    = 6 * time.Hour
 )
 
 var userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+// innertubeCfg holds the YouTube innertube web client credentials resolved at
+// runtime. The API key is YouTube's public web client key (served to every
+// visitor of youtube.com); it is fetched dynamically rather than hard-coded, so
+// the source contains no secret literal and Google's key rotations are picked
+// up automatically. Override with INNERTUBE_KEY / INNERTUBE_CLIENT_VERSION.
+type innertubeCfg struct {
+	apiKey        string
+	clientVersion string
+}
+
+var innertubeCache = struct {
+	sync.Mutex
+	cfg     *innertubeCfg
+	fetched time.Time
+}{}
+
+// innertubeConfig returns the innertube API key + client version. It prefers an
+// explicit INNERTUBE_KEY env override; otherwise it scrapes youtube.com (cached
+// for innertubeCacheTTL). Fetch failures are not cached so they retry on the
+// next call.
+func (c *Client) innertubeConfig(ctx context.Context) (*innertubeCfg, error) {
+	if k := strings.TrimSpace(os.Getenv("INNERTUBE_KEY")); k != "" {
+		v := strings.TrimSpace(os.Getenv("INNERTUBE_CLIENT_VERSION"))
+		if v == "" {
+			v = defaultClientVersion
+		}
+		return &innertubeCfg{apiKey: k, clientVersion: v}, nil
+	}
+
+	innertubeCache.Lock()
+	defer innertubeCache.Unlock()
+	if innertubeCache.cfg != nil && time.Since(innertubeCache.fetched) < innertubeCacheTTL {
+		return innertubeCache.cfg, nil
+	}
+	cfg, err := c.fetchInnertubeConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	innertubeCache.cfg = cfg
+	innertubeCache.fetched = time.Now()
+	return cfg, nil
+}
+
+// fetchInnertubeConfig scrapes youtube.com for the embedded INNERTUBE_API_KEY
+// and INNERTUBE_CLIENT_VERSION.
+func (c *Client) fetchInnertubeConfig(ctx context.Context) (*innertubeCfg, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, "https://www.youtube.com/", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch youtube homepage: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("youtube homepage returned status %d", resp.StatusCode)
+	}
+	page, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if err != nil {
+		return nil, fmt.Errorf("read youtube homepage: %w", err)
+	}
+
+	key := extractInnertubeField(page, "INNERTUBE_API_KEY")
+	if key == "" {
+		return nil, fmt.Errorf("INNERTUBE_API_KEY not found on youtube homepage")
+	}
+	ver := extractInnertubeField(page, "INNERTUBE_CLIENT_VERSION")
+	if ver == "" {
+		ver = defaultClientVersion
+	}
+	return &innertubeCfg{apiKey: key, clientVersion: ver}, nil
+}
+
+func extractInnertubeField(page []byte, field string) string {
+	re := regexp.MustCompile(`"` + field + `":"([^"]+)"`)
+	m := re.FindSubmatch(page)
+	if len(m) >= 2 {
+		return string(m[1])
+	}
+	return ""
+}
 
 // Search queries YouTube and returns up to limit tracks.
 func (c *Client) Search(ctx context.Context, query string, limit int) ([]Track, error) {
@@ -42,11 +133,16 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]Track, 
 		limit = 8
 	}
 
+	cfg, err := c.innertubeConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve innertube config: %w", err)
+	}
+
 	body := map[string]any{
 		"context": map[string]any{
 			"client": map[string]any{
 				"clientName":    "WEB",
-				"clientVersion": clientVersion,
+				"clientVersion": cfg.clientVersion,
 				"hl":            "en",
 				"gl":            "US",
 			},
@@ -61,7 +157,7 @@ func (c *Client) Search(ctx context.Context, query string, limit int) ([]Track, 
 	reqCtx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, innertubeURL, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, innertubeSearchURL+cfg.apiKey, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}

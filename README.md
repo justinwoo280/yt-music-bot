@@ -81,6 +81,8 @@ docker run -d --restart unless-stopped --env-file .env --name yt-music-bot yt-mu
 | `MAX_DURATION_MIN` | 否 | 12 | 拒绝超过此时长的歌曲 |
 | `SEARCH_LIMIT` | 否 | 8 | 搜索结果数量（≤20） |
 | `DOWNLOAD_DIR` | 否 | 系统临时 | 临时下载目录 |
+| `INNERTUBE_KEY` | 否 | 运行时抓取 | YouTube innertube 公共 web key（默认从 youtube.com 动态获取，无需设置） |
+| `INNERTUBE_CLIENT_VERSION` | 否 | 内置默认 | innertube web client 版本，配合 `INNERTUBE_KEY` 使用 |
 
 ## 用法
 
