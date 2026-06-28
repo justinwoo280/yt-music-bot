@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.md
+yt-music-bot
+yt-music-bot.exe
+**/*_test.go
+node_modules

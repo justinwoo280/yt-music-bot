@@ -1,0 +1,10 @@
+# build artifact
+yt-music-bot
+yt-music-bot.exe
+
+# env
+.env
+
+# editor / os
+.DS_Store
+*.swp

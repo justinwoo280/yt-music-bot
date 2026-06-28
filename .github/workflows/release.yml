@@ -1,0 +1,238 @@
+name: Release
+
+# Cross-platform binary build (+ GitHub Release) and a multi-arch Docker image
+# pushed to ghcr.io. Triggered by pushing a v* tag, or manually by providing a
+# version string. Android is intentionally not built.
+#
+# Docker is built natively (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm)
+# and the two single-arch images are merged into one multi-arch manifest —
+# no QEMU emulation.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (without leading v), e.g. 1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            V="${{ inputs.version }}"
+          else
+            V="${GITHUB_REF_NAME}"
+          fi
+          V="${V#v}"   # strip a leading v if present
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}"   >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}${{ matrix.goarm && format('v{0}', matrix.goarm) }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux,   arch: amd64 }
+          - { os: linux,   arch: "386" }
+          - { os: linux,   arch: arm64 }
+          - { os: linux,   arch: arm, goarm: "6" }
+          - { os: linux,   arch: arm, goarm: "7" }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: "386" }
+          - { os: windows, arch: arm64 }
+          - { os: darwin,  arch: amd64 }
+          - { os: darwin,  arch: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '~1.26.4'   # >=1.26.4 <1.27.0 (follow 1.26.x patches)
+          cache: true
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GOARM: ${{ matrix.goarm }}
+        run: |
+          set -euo pipefail
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ needs.prepare.outputs.version }}" \
+            -o yt-music-bot .
+
+      - name: Set archive name
+        id: name
+        run: |
+          set -euo pipefail
+          DIR="yt-music-bot-${{ needs.prepare.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then DIR="${DIR}v${{ matrix.goarm }}"; fi
+          echo "dir=${DIR}" >> "$GITHUB_OUTPUT"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            echo "ext=zip" >> "$GITHUB_OUTPUT"
+          else
+            echo "ext=tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Archive
+        run: |
+          set -euo pipefail
+          DIR="${{ steps.name.outputs.dir }}"
+          EXT="${{ steps.name.outputs.ext }}"
+          mkdir -p "${DIR}" dist
+          cp LICENSE "${DIR}/"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cp yt-music-bot "${DIR}/yt-music-bot.exe"
+          else
+            cp yt-music-bot "${DIR}/yt-music-bot"
+          fi
+          if [ "${EXT}" = "zip" ]; then
+            zip -r "dist/${DIR}.zip" "${DIR}"
+          else
+            tar -czf "dist/${DIR}.tar.gz" "${DIR}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.dir }}
+          path: dist/${{ steps.name.outputs.dir }}.${{ steps.name.outputs.ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: yt-music-bot-*
+          merge-multiple: true
+
+      - name: List
+        run: ls -lh dist
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  docker-build:
+    name: Docker ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux/amd64, runner: ubuntu-latest,    suffix: amd64 }
+          - { platform: linux/arm64, runner: ubuntu-24.04-arm, suffix: arm64 }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase image name
+        id: repo
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=docker-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.suffix }}
+          outputs: type=image,name=ghcr.io/${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-merge:
+    name: Docker manifest (ghcr.io)
+    needs: [prepare, docker-build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: docker-digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase image name
+        id: repo
+        run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ steps.repo.outputs.name }}"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.prepare.outputs.tag }}" \
+            -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Inspect
+        run: |
+          docker buildx imagetools inspect "ghcr.io/${{ steps.repo.outputs.name }}:${{ needs.prepare.outputs.tag }}"

@@ -1,0 +1,19 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Closing response bodies / temp files and removing temp files are
+      # best-effort cleanup; their errors are intentionally ignored.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - os.Remove
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

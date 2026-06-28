@@ -1,0 +1,13 @@
+services:
+  yt-music-bot:
+    build: .
+    image: yt-music-bot:latest
+    container_name: yt-music-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Optional: persist / point the temp download dir to a host volume.
+    # volumes:
+    #   - ./downloads:/tmp/downloads
+    # environment:
+    #   DOWNLOAD_DIR: /tmp/downloads
